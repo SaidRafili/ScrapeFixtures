@@ -25,9 +25,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: playwright install --with-deps chromium     # only used if FBref rejects the plain request
+      - run: playwright install --with-deps chromium
+      - run: sudo apt-get install -y xvfb               # virtual screen: FBref's bot check blocks headless browsers
       - name: Scrape and load
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FORCE: ${{ inputs.force && '1' || '0' }}
-        run: python sync.py
+        run: xvfb-run -a python sync.py

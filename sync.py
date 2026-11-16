@@ -1,45 +1,78 @@
 #!/usr/bin/env python3
 """
-sync.py - fetch FBref "Scores & Fixtures" pages, build the SQL with fbref_matches.py and load it into Neon.
+sync.py - open FBref "Scores & Fixtures" pages in a real browser, build the SQL with fbref_matches.py
+and load it into Neon.
 
-    DATABASE_URL=postgres://... python sync.py                 # all leagues in leagues.json
-    python sync.py --dry-run                                   # fetch + build SQL only, touch nothing
-    python sync.py --html Ligue_1.html --league "Ligue 1"      # use a saved page instead of fetching
+    1. put the league links in leagues.txt (one per line)       <- the only thing you configure
+    2. DATABASE_URL=postgres://... python sync.py
+       python sync.py --dry-run                                  # fetch + build SQL into ./sql, touch no database
+       python sync.py --html Ligue_1.html --dry-run              # use a page you saved yourself, no browser
+       python sync.py https://fbref.com/en/comps/9/schedule/... # links on the command line instead of leagues.txt
 
-Safety:
-  * Each league is loaded in ONE transaction (DELETE + INSERT for played and unplayed together), so the
-    table is never left half-empty if something fails.
-  * A league is skipped (nothing deleted) if the fetch fails, 0 matches parse, or the played matches
-    would shrink by more than 20% versus what the table already has. Set FORCE=1 to override the shrink check.
-  * start_id of every league in leagues.json must be spaced further apart than its match count
-    (use 0, 1000, 2000, ...) because event_id / rn = start_id + position and must not collide.
+Per league the script works out everything itself:
+  * league id  = the number in the link (/comps/13/...)
+  * start id   = league id * 10000, so event_id / rn are stable and can never collide between leagues
+  * season     = read from the page
+
+FBref sits behind a bot check ("Just a moment..."): plain HTTP requests get a 403. So the pages are opened in
+a REAL (visible) Chromium, one browser for the whole run so the check is passed only once. On a server there is
+no screen: run it under a virtual one (`xvfb-run -a python sync.py`, the GitHub workflow already does).
+HEADLESS=1 forces headless mode (usually blocked).
+
+Safety: every league loads in ONE transaction; it is skipped (nothing deleted) if the page can not be fetched,
+0 matches parse, or the played matches would shrink by >20% vs the table (FORCE=1 overrides that).
 """
-import argparse, json, os, re, subprocess, sys, tempfile, time
+import argparse, os, re, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/131.0.0.0 Safari/537.36")
-DELAY = 8   # seconds between FBref requests (their limit is 10 requests/minute)
+DELAY = 8          # seconds between FBref pages (their limit is 10 requests/minute)
+TRIES = 3
 
 
-def fetch(url):
-    import requests
-    r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en"}, timeout=60)
-    if r.status_code == 200 and "<table" in r.text:
-        return r.text
-    print(f"  plain request gave HTTP {r.status_code}; trying a headless browser", flush=True)
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        b = p.chromium.launch()
-        pg = b.new_context(user_agent=UA, locale="en-US").new_page()
-        resp = pg.goto(url, wait_until="domcontentloaded", timeout=90_000)
-        pg.wait_for_timeout(4000)
-        html = pg.content()
-        status = resp.status if resp else 0
-        b.close()
-    if "<table" not in html or status >= 400:
-        raise RuntimeError(f"FBref blocked the request (HTTP {status})")
-    return html
+def read_links(path, cli):
+    links = list(cli)
+    if not links and os.path.exists(path):
+        links = [l.strip() for l in open(path, encoding="utf-8") if l.strip() and not l.strip().startswith("#")]
+    out = []
+    for u in links:
+        m = re.search(r"fbref\.com/\w+/comps/(\d+)/", u)
+        if not m:
+            sys.exit(f"Not an FBref league link: {u}\n(expected https://fbref.com/en/comps/<id>/schedule/...-Scores-and-Fixtures)")
+        out.append((u, int(m.group(1))))
+    if not out:
+        sys.exit(f"No league links. Add them to {path} (one per line).")
+    return out
+
+
+class Browser:
+    """One real Chromium for the whole run, so FBref's bot check is passed once and the cookie is reused."""
+    def __enter__(self):
+        from playwright.sync_api import sync_playwright
+        self.pw = sync_playwright().start()
+        self.b = self.pw.chromium.launch(headless=os.environ.get("HEADLESS") == "1",
+                                         args=["--disable-blink-features=AutomationControlled"])
+        self.page = self.b.new_context(locale="en-US", viewport={"width": 1366, "height": 900}).new_page()
+        return self
+
+    def __exit__(self, *a):
+        self.b.close(); self.pw.stop()
+
+    def get(self, url):
+        from playwright.sync_api import TimeoutError as PWTimeout
+        last = ""
+        for n in range(1, TRIES + 1):
+            try:
+                resp = self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+                # the bot check page is replaced by the real page after a few seconds
+                self.page.wait_for_selector("table[id^=sched_]", state="attached", timeout=90_000)
+                return self.page.content()
+            except PWTimeout:
+                last = f"timeout, page title: {self.page.title()!r}"
+            except Exception as e:
+                last = str(e).splitlines()[0]
+            print(f"  attempt {n}/{TRIES} failed ({last})", flush=True)
+            time.sleep(15 * n)
+        raise RuntimeError(f"could not get the fixtures table: {last}")
 
 
 def build_sql(html_path, out_dir, start_id, teams, overrides):
@@ -62,57 +95,60 @@ def load(url, name, sqls, force):
     played, unplayed = sqls["played"], sqls["unplayed"]
     new_played = n_matches(played)
     if new_played + n_matches(unplayed) == 0:
-        print(f"  {name}: 0 matches parsed, skipping (nothing deleted)"); return False
+        print(f"  {name}: 0 matches parsed, skipping (nothing deleted)"); return
     with psycopg.connect(url) as conn:                       # `with` = one transaction, rolled back on error
         d = re.search(r'^DELETE FROM "fixtures" (WHERE .*);$', played, re.M)
         if d and not force:
             old = conn.execute(f'SELECT count(*) FROM "fixtures" {d.group(1)}').fetchone()[0]
             if old and new_played < old * 0.8:
                 print(f"  {name}: played would drop {old} -> {new_played}; skipping. Re-run with FORCE=1 if that is right.")
-                return False
+                return
         conn.execute(played)
         conn.execute(unplayed)
     print(f"  {name}: loaded {new_played} played + {n_matches(unplayed)} unplayed")
-    return True
+
+
+def run_one(label, html_path, comp_id, args, url):
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(HERE, "sql") if args.dry_run else os.path.join(tmp, "sql")
+        sqls = build_sql(html_path, out, comp_id * 10000, args.teams, args.overrides)
+        if not args.dry_run:
+            load(url, label, sqls, os.environ.get("FORCE") == "1")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.path.join(HERE, "leagues.json"))
+    ap.add_argument("links", nargs="*", help="FBref league links (default: the ones in leagues.txt)")
+    ap.add_argument("--leagues", default=os.path.join(HERE, "leagues.txt"))
     ap.add_argument("--teams", default=os.path.join(HERE, "teams.csv"))
     ap.add_argument("--overrides", default=os.path.join(HERE, "team_overrides.json"))
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--html", help="saved FBref page to use instead of fetching (needs --league)")
-    ap.add_argument("--league", help="only this league name from leagues.json")
+    ap.add_argument("--html", help="saved page to use instead of opening FBref (league id is read from it)")
     args = ap.parse_args()
 
     url = os.environ.get("DATABASE_URL")
     if not url and not args.dry_run:
         sys.exit("Set DATABASE_URL (your Neon connection string) or use --dry-run")
-    leagues = [l for l in json.load(open(args.config)) if not args.league or l["name"] == args.league]
-    if not leagues:
-        sys.exit("No matching league in leagues.json")
-    force = os.environ.get("FORCE") == "1"
-    failed = []
 
-    for i, lg in enumerate(leagues):
-        print(f"\n== {lg['name']}", flush=True)
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                if args.html:
-                    html_path = args.html
-                else:
-                    if i: time.sleep(DELAY)
+    if args.html:
+        import fbref
+        run_one(os.path.basename(args.html), args.html, fbref.parse_page(args.html)["league_id"], args, url)
+        return
+
+    failed, links = [], read_links(args.leagues, args.links)     # validate the links before opening a browser
+    with Browser() as br:
+        for i, (link, comp_id) in enumerate(links):
+            print(f"\n== {link}", flush=True)
+            try:
+                if i: time.sleep(DELAY)
+                with tempfile.TemporaryDirectory() as tmp:
                     html_path = os.path.join(tmp, "page.html")
-                    open(html_path, "w", encoding="utf-8").write(fetch(lg["url"]))
-                out = os.path.join(HERE, "sql") if args.dry_run else os.path.join(tmp, "sql")
-                sqls = build_sql(html_path, out, lg.get("start_id", 0), args.teams, args.overrides)
-                if not args.dry_run:
-                    load(url, lg["name"], sqls, force)
-        except Exception as e:                 # one broken league must not stop the others
-            print(f"  FAILED: {e}"); failed.append(lg["name"])
+                    open(html_path, "w", encoding="utf-8").write(br.get(link))
+                    run_one(link.rstrip("/").rsplit("/", 1)[-1], html_path, comp_id, args, url)
+            except Exception as e:                 # one broken league must not stop the others
+                print(f"  FAILED: {e}"); failed.append(link)
     if failed:
-        sys.exit(f"\nFailed: {', '.join(failed)}")
+        sys.exit("\nFailed:\n  " + "\n  ".join(failed))
 
 
 if __name__ == "__main__":
