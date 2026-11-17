@@ -1,7 +1,7 @@
 [
-  {
-    "name": "Ligue 1",
-    "url": "https://fbref.com/en/comps/13/schedule/Ligue-1-Scores-and-Fixtures",
-    "start_id": 0
-  }
+  {"league": "ENG-Premier League", "comp_id": 9,  "country": "eng", "tz": "Europe/London", "season_style": "split"},
+  {"league": "ESP-La Liga",        "comp_id": 12, "country": "esp", "tz": "Europe/Madrid", "season_style": "split"},
+  {"league": "FRA-Ligue 1",        "comp_id": 13, "country": "fra", "tz": "Europe/Paris",  "season_style": "split"},
+  {"league": "GER-Bundesliga",     "comp_id": 20, "country": "ger", "tz": "Europe/Berlin", "season_style": "split"},
+  {"league": "ITA-Serie A",        "comp_id": 11, "country": "ita", "tz": "Europe/Rome",   "season_style": "split"}
 ]
