@@ -61,7 +61,11 @@ def season_for(style, today=None, override=None):
 # ------------------------------------------------------------------ scrape
 def fetch_schedule(league, season):
     import soccerdata as sd
-    fb = sd.FBref(leagues=league, seasons=season, proxy=os.environ.get("PROXY") or None, no_cache=True)
+    proxy = os.environ.get("PROXY") or None
+    try:
+        fb = sd.FBref(leagues=league, seasons=season, proxy=proxy, no_cache=True)
+    except TypeError:                                       # newer soccerdata versions may not accept `proxy`
+        fb = sd.FBref(leagues=league, seasons=season, no_cache=True)
     return fb.read_schedule().reset_index()
 
 
