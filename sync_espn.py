@@ -39,6 +39,14 @@ DDL = """CREATE TABLE IF NOT EXISTS "fixtures" (
 );"""
 
 
+EVENT_COLUMNS = ["event_id", "team_side", "minute", "event_type", "player", "assist"]
+EVENTS_DDL = """CREATE TABLE IF NOT EXISTS "fixture_events" (
+\t"event_id" varchar(255), "team_side" varchar(255), "minute" varchar(255),
+\t"event_type" varchar(255), "player" varchar(255), "assist" varchar(255)
+);"""
+RECENT_DAYS = 3        # finished matches this recent are re-fetched every run (VAR / late corrections)
+
+
 # ------------------------------------------------------------------ seasons
 def season_bounds(style, today=None, override=None):
     """-> (start date, end date, label). split: Jul 1 - Jun 30; calendar: Jan 1 - Dec 31."""
@@ -159,13 +167,85 @@ def build_rows(events, cfg, label, now):
     return [[None if v in (None, "") else str(v) for v in r] for r in rows]
 
 
+# ------------------------------------------------------------------ goals & cards (fixture_events)
+def classify(text):
+    """ESPN keyEvent type text -> our event_type, or None for events we do not store (subs, VAR, misses...)."""
+    t = (text or "").lower()
+    if "shootout" in t:
+        return None
+    if "own" in t and "goal" in t:
+        return "own_goal"
+    if "penalty" in t:
+        return None if any(w in t for w in ("miss", "saved", "save", "hit", "post", "bar")) else "penalty_goal"
+    if "goal" in t:
+        return "goal"
+    if "yellow" in t:
+        return "second_yellow" if "second" in t else "yellow_card"
+    if "red" in t:
+        return "red_card"
+    return None
+
+
+def parse_key_events(summary, event_id, home_id, away_id):
+    out = []
+    for k in summary.get("keyEvents") or []:
+        et = classify((k.get("type") or {}).get("text") or (k.get("type") or {}).get("type"))
+        if not et or k.get("shootout"):
+            continue
+        tid = str((k.get("team") or {}).get("id") or "")
+        side = "home" if tid == str(home_id) else "away" if tid == str(away_id) else None
+        if not side:
+            continue
+        minute = str((k.get("clock") or {}).get("displayValue") or "").replace("'", "").replace(" ", "")
+        names = [(p.get("athlete") or {}).get("displayName") for p in k.get("participants") or []]
+        names = [n for n in names if n]
+        player = names[0] if names else None
+        assist = names[1] if len(names) > 1 and et in ("goal", "penalty_goal") else None
+        out.append([event_id, side, minute or None, et, player, assist])
+    return out
+
+
+def fetch_match_events(slug, rows, skip_ids):
+    """rows = fixtures rows; fetch goals/cards for finished matches not in skip_ids."""
+    ix = {c: COLUMNS.index(c) for c in ("event_id", "home_team_id", "away_team_id", "status_id")}
+    todo = [r for r in rows if r[ix["status_id"]] == FINAL and r[ix["event_id"]] not in skip_ids]
+    out, ids = [], set()
+    print(f"  fetching goals/cards for {len(todo)} matches", flush=True)
+    for n, r in enumerate(todo, 1):
+        eid = r[ix["event_id"]]
+        try:
+            summary = get_json(f"{BASE}/{slug}/summary?event={eid}")
+        except Exception as e:                              # one bad match must not stop the rest
+            print(f"  events for {eid} failed: {e}")
+            continue
+        out += parse_key_events(summary, eid, r[ix["home_team_id"]], r[ix["away_team_id"]])
+        ids.add(eid)
+        time.sleep(0.2)
+    return out, ids
+
+
+def stored_event_ids(url, rows, create_table):
+    """Finished matches that already have events stored, minus recently played ones (those get refreshed)."""
+    import psycopg
+    cutoff = (datetime.now(timezone.utc).date().toordinal() - RECENT_DAYS)
+    old = [r[COLUMNS.index("event_id")] for r in rows
+           if r[COLUMNS.index("status_id")] == FINAL
+           and date.fromisoformat(r[COLUMNS.index("date")][:10]).toordinal() < cutoff]
+    with psycopg.connect(url) as conn:
+        if create_table:
+            conn.execute(EVENTS_DDL)
+        got = conn.execute('SELECT DISTINCT "event_id" FROM "fixture_events" WHERE "event_id" = ANY(%s)', (old,)).fetchall()
+    return {g[0] for g in got}
+
+
 # ------------------------------------------------------------------ database
-def load(url, cfg, label, rows, force, create_table):
+def load(url, cfg, label, rows, force, create_table, ev_rows=(), ev_ids=()):
     import psycopg
     played = sum(r[COLUMNS.index("status_id")] == FINAL for r in rows)
     with psycopg.connect(url) as conn:                      # one transaction, rolled back on error
         if create_table:
             conn.execute(DDL)
+            conn.execute(EVENTS_DDL)
         conn.execute('ALTER TABLE "fixtures" ALTER COLUMN "home_team_abbr" TYPE varchar(10), '
                      'ALTER COLUMN "away_team_abbr" TYPE varchar(10)')
         where, params = '"league_id" = %s AND "season_type" = %s', (str(cfg["comp_id"]), label)
@@ -179,7 +259,12 @@ def load(url, cfg, label, rows, force, create_table):
         cols = ", ".join(f'"{c}"' for c in COLUMNS)
         with conn.cursor() as cur:
             cur.executemany(f'INSERT INTO "fixtures" ({cols}) VALUES ({", ".join(["%s"] * len(COLUMNS))})', rows)
-    print(f"  loaded {played} finished + {len(rows) - played} other")
+        if ev_ids:                                          # replace events of the matches we just re-fetched
+            conn.execute('DELETE FROM "fixture_events" WHERE "event_id" = ANY(%s)', (list(ev_ids),))
+            with conn.cursor() as cur:
+                cur.executemany('INSERT INTO "fixture_events" ("event_id","team_side","minute","event_type","player","assist") '
+                                'VALUES (%s,%s,%s,%s,%s,%s)', ev_rows)
+    print(f"  loaded {played} finished + {len(rows) - played} other, {len(ev_rows)} goal/card events for {len(ev_ids)} matches")
 
 
 # ------------------------------------------------------------------ main
@@ -190,6 +275,7 @@ def main():
     ap.add_argument("--season", help="2025-2026 (split) or 2025 (calendar)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--create-table", action="store_true")
+    ap.add_argument("--no-events", action="store_true", help="skip goals/cards (fixture_events)")
     args = ap.parse_args()
     url = os.environ.get("DATABASE_URL")
     if not url and not args.dry_run:
@@ -209,14 +295,21 @@ def main():
                 print("  0 matches returned, skipping (nothing deleted)")
                 continue
             print(f"  {len(rows)} matches")
+            ev_rows, ev_ids = [], set()
+            if not args.no_events:
+                skip = set() if args.dry_run else stored_event_ids(url, rows, args.create_table)
+                ev_rows, ev_ids = fetch_match_events(cfg["espn"], rows, skip)
             if args.dry_run:
                 os.makedirs(os.path.join(HERE, "out"), exist_ok=True)
                 path = os.path.join(HERE, "out", re.sub(r"\W+", "_", cfg["espn"]) + ".csv")
                 with open(path, "w", newline="", encoding="utf-8") as fh:
                     w = csv.writer(fh); w.writerow(COLUMNS); w.writerows(rows)
                 print(f"  wrote {path}")
+                if ev_rows:
+                    with open(os.path.join(HERE, "out", re.sub(r"\W+", "_", cfg["espn"]) + "_events.csv"), "w", newline="", encoding="utf-8") as fh:
+                        w = csv.writer(fh); w.writerow(EVENT_COLUMNS); w.writerows(ev_rows)
             else:
-                load(url, cfg, label, rows, force, args.create_table)
+                load(url, cfg, label, rows, force, args.create_table, ev_rows, ev_ids)
         except (Exception, SystemExit) as e:
             print(f"  FAILED: {e}"); failed.append(cfg["espn"])
     if failed:
