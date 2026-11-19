@@ -23,7 +23,7 @@ from datetime import date, datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.environ.get("ESPN_BASE", "https://site.api.espn.com/apis/site/v2/sports/soccer")
-FINAL = "28"
+FINISHED = ("28", "45", "46", "47")     # same set the Futlog site treats as a result: full time, extra time, penalties
 COLUMNS = ["rn", "season_type", "league_id", "event_id", "date", "venue_id", "attendance", "home_team_id",
            "away_team_id", "home_team_winner", "away_team_winner", "home_team_score", "away_team_score",
            "home_team_shootout_score", "away_team_shootout_score", "status_id", "update_time",
@@ -43,7 +43,8 @@ EVENT_COLUMNS = ["event_id", "team_side", "minute", "event_type", "player", "ass
 EVENTS_DDL = """CREATE TABLE IF NOT EXISTS "fixture_events" (
 \t"event_id" varchar(255), "team_side" varchar(255), "minute" varchar(255),
 \t"event_type" varchar(255), "player" varchar(255), "assist" varchar(255)
-);"""
+);
+CREATE INDEX IF NOT EXISTS fixture_events_event_idx ON "fixture_events" ("event_id");"""
 RECENT_DAYS = 3        # finished matches this recent are re-fetched every run (VAR / late corrections)
 
 
@@ -208,7 +209,7 @@ def parse_key_events(summary, event_id, home_id, away_id):
 def fetch_match_events(slug, rows, skip_ids):
     """rows = fixtures rows; fetch goals/cards for finished matches not in skip_ids."""
     ix = {c: COLUMNS.index(c) for c in ("event_id", "home_team_id", "away_team_id", "status_id")}
-    todo = [r for r in rows if r[ix["status_id"]] == FINAL and r[ix["event_id"]] not in skip_ids]
+    todo = [r for r in rows if r[ix["status_id"]] in FINISHED and r[ix["event_id"]] not in skip_ids]
     out, ids = [], set()
     print(f"  fetching goals/cards for {len(todo)} matches", flush=True)
     for n, r in enumerate(todo, 1):
@@ -229,7 +230,7 @@ def stored_event_ids(url, rows, create_table):
     import psycopg
     cutoff = (datetime.now(timezone.utc).date().toordinal() - RECENT_DAYS)
     old = [r[COLUMNS.index("event_id")] for r in rows
-           if r[COLUMNS.index("status_id")] == FINAL
+           if r[COLUMNS.index("status_id")] in FINISHED
            and date.fromisoformat(r[COLUMNS.index("date")][:10]).toordinal() < cutoff]
     with psycopg.connect(url) as conn:
         if create_table:
@@ -241,7 +242,7 @@ def stored_event_ids(url, rows, create_table):
 # ------------------------------------------------------------------ database
 def load(url, cfg, label, rows, force, create_table, ev_rows=(), ev_ids=()):
     import psycopg
-    played = sum(r[COLUMNS.index("status_id")] == FINAL for r in rows)
+    played = sum(r[COLUMNS.index("status_id")] in FINISHED for r in rows)
     with psycopg.connect(url) as conn:                      # one transaction, rolled back on error
         if create_table:
             conn.execute(DDL)
@@ -250,8 +251,8 @@ def load(url, cfg, label, rows, force, create_table, ev_rows=(), ev_ids=()):
                      'ALTER COLUMN "away_team_abbr" TYPE varchar(10)')
         where, params = '"league_id" = %s AND "season_type" = %s', (str(cfg["comp_id"]), label)
         if not force:
-            old = conn.execute(f'SELECT count(*) FROM "fixtures" WHERE {where} AND "status_id" = %s',
-                               params + (FINAL,)).fetchone()[0]
+            old = conn.execute(f'SELECT count(*) FROM "fixtures" WHERE {where} AND "status_id" = ANY(%s)',
+                               params + (list(FINISHED),)).fetchone()[0]
             if old and played < old * 0.8:
                 print(f"  finished would drop {old} -> {played}; skipping. Re-run with FORCE=1 if that is right.")
                 return
