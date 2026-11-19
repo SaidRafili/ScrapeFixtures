@@ -17,7 +17,7 @@ leagues.json (one object per league):  {"espn": "eng.1", "comp_id": 9, "season_s
 Per league+season: DELETE + INSERT in ONE transaction. Skipped (nothing deleted) if the fetch fails, returns
 0 matches, or finished matches would shrink >20% vs the table (FORCE=1 overrides).
 """
-import argparse, calendar, csv, json, os, re, sys, time
+import argparse, csv, json, os, re, sys, time
 import urllib.error, urllib.parse, urllib.request
 from datetime import date, datetime, timezone
 
@@ -54,12 +54,12 @@ def season_bounds(style, today=None, override=None):
     return date(y, 7, 1), date(y + 1, 6, 30), f"{y}/{str(y + 1)[2:]}"
 
 
-def month_chunks(start, end):
+def date_chunks(start, end, days=10):
     d = start
     while d <= end:
-        last = date(d.year, d.month, calendar.monthrange(d.year, d.month)[1])
-        yield d, min(last, end)
-        d = date(last.year + (last.month == 12), last.month % 12 + 1, 1)
+        e = min(date.fromordinal(d.toordinal() + days - 1), end)
+        yield d, e
+        d = date.fromordinal(e.toordinal() + 1)
 
 
 # ------------------------------------------------------------------ fetch
@@ -69,20 +69,32 @@ def get_json(url, tries=4):
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code != 429:              # 4xx will not fix itself: fail fast
+                raise
+            err = e
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-            if i == tries:
-                raise RuntimeError(f"{url}: {e}")
-            time.sleep(3 * i)
+            err = e
+        if i == tries:
+            raise RuntimeError(f"{url}: {err}")
+        time.sleep(3 * i)
 
 
 def fetch_events(slug, start, end):
-    events = {}
-    for a, b in month_chunks(start, end):
-        q = urllib.parse.urlencode({"dates": f"{a:%Y%m%d}-{b:%Y%m%d}", "limit": 1000})
-        data = get_json(f"{BASE}/{slug}/scoreboard?{q}")
+    events, use_limit = {}, True
+    for a, b in date_chunks(start, end):
+        url = f"{BASE}/{slug}/scoreboard?dates={a:%Y%m%d}-{b:%Y%m%d}"
+        try:
+            data = get_json(url + ("&limit=300" if use_limit else ""))
+        except urllib.error.HTTPError as e:
+            if e.code != 400 or not use_limit:
+                raise RuntimeError(f"{url}: {e}")
+            use_limit = False                               # ESPN rejected `limit`: go without it from now on
+            print("  ESPN rejected 'limit', retrying without it", flush=True)
+            data = get_json(url)
         for ev in data.get("events") or []:
             events[str(ev["id"])] = ev
-        time.sleep(0.5)                                     # be polite
+        time.sleep(0.3)                                     # be polite
     return list(events.values())
 
 
