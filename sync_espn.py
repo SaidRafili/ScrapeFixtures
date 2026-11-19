@@ -17,7 +17,7 @@ leagues.json (one object per league):  {"espn": "eng.1", "comp_id": 9, "season_s
 Per league+season: DELETE + INSERT in ONE transaction. Skipped (nothing deleted) if the fetch fails, returns
 0 matches, or finished matches would shrink >20% vs the table (FORCE=1 overrides).
 """
-import argparse, csv, json, os, re, sys, time
+import argparse, calendar, csv, json, os, re, sys, time
 import urllib.error, urllib.parse, urllib.request
 from datetime import date, datetime, timezone
 
@@ -54,12 +54,11 @@ def season_bounds(style, today=None, override=None):
     return date(y, 7, 1), date(y + 1, 6, 30), f"{y}/{str(y + 1)[2:]}"
 
 
-def date_chunks(start, end, days=10):
-    d = start
-    while d <= end:
-        e = min(date.fromordinal(d.toordinal() + days - 1), end)
-        yield d, e
-        d = date.fromordinal(e.toordinal() + 1)
+def months(start, end):
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        yield y, m
+        y, m = y + (m == 12), m % 12 + 1
 
 
 # ------------------------------------------------------------------ fetch
@@ -80,19 +79,39 @@ def get_json(url, tries=4):
         time.sleep(3 * i)
 
 
-def fetch_events(slug, start, end):
-    events, use_limit = {}, True
-    for a, b in date_chunks(start, end):
-        url = f"{BASE}/{slug}/scoreboard?dates={a:%Y%m%d}-{b:%Y%m%d}"
+def _events(data):
+    return data.get("events") or []
+
+
+def fetch_month(slug, y, m):
+    """ESPN no longer accepts date ranges (dates=A-B -> 400), only dates=YYYYMMDD or dates=YYYYMM.
+    Ask for the month; if that is refused or may be truncated, ask day by day."""
+    url = f"{BASE}/{slug}/scoreboard?dates={y}{m:02d}"
+    for extra, cap in (("&limit=1000", 1000), ("", 100)):
         try:
-            data = get_json(url + ("&limit=300" if use_limit else ""))
+            evs = _events(get_json(url + extra))
         except urllib.error.HTTPError as e:
-            if e.code != 400 or not use_limit:
-                raise RuntimeError(f"{url}: {e}")
-            use_limit = False                               # ESPN rejected `limit`: go without it from now on
-            print("  ESPN rejected 'limit', retrying without it", flush=True)
-            data = get_json(url)
-        for ev in data.get("events") or []:
+            if e.code != 400:
+                raise RuntimeError(f"{url}{extra}: {e}")
+            continue
+        if len(evs) < cap:                                  # got everything
+            return evs
+        break                                               # looks truncated -> per day
+    print(f"  {y}-{m:02d}: month request refused/truncated, fetching day by day", flush=True)
+    out = []
+    for day in range(1, calendar.monthrange(y, m)[1] + 1):
+        try:
+            out += _events(get_json(f"{BASE}/{slug}/scoreboard?dates={y}{m:02d}{day:02d}"))
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"{slug} {y}{m:02d}{day:02d}: {e}")
+        time.sleep(0.2)
+    return out
+
+
+def fetch_events(slug, start, end):
+    events = {}
+    for y, m in months(start, end):
+        for ev in fetch_month(slug, y, m):
             events[str(ev["id"])] = ev
         time.sleep(0.3)                                     # be polite
     return list(events.values())
