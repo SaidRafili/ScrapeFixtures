@@ -17,7 +17,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45     # first run fetches goals/cards for every finished match; later runs are quick
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

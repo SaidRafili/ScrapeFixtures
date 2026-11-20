@@ -10,9 +10,15 @@ No browser, no captcha, no HTML parsing, no team-name matching: ESPN's team ids 
     python sync_espn.py --create-table
 
 leagues.json (one object per league):  {"espn": "eng.1", "comp_id": 9, "season_style": "split"}
-    espn          ESPN league slug (eng.1, esp.1, ger.1, ita.1, fra.1 ...)
+    espn          ESPN league slug (eng.1, esp.1, tur.1, fifa.friendly, uefa.nations ...)
     comp_id       written to league_id (kept equal to the old FBref number so existing rows are replaced)
-    season_style  "split" (Jul-Jun, label 2026/27) or "calendar" (Jan-Dec, label 2026)
+    season_style  "split" (Jul-Jun, label 2026/27) or "calendar" (Jan-Dec, label 2026; used for national teams)
+    name          optional, only for the log
+    optional      optional; true = if ESPN rejects the slug / has no such league, warn and carry on (no red run)
+
+    python sync_espn.py --find azer       # list ESPN league slugs containing "azer" (to check a slug exists)
+
+--season: "2025-2026" applies to split leagues only, "2025" to calendar leagues only (others are skipped).
 
 Per league+season: DELETE + INSERT in ONE transaction. Skipped (nothing deleted) if the fetch fails, returns
 0 matches, or finished matches would shrink >20% vs the table (FORCE=1 overrides).
@@ -53,11 +59,14 @@ def season_bounds(style, today=None, override=None):
     """-> (start date, end date, label). split: Jul 1 - Jun 30; calendar: Jan 1 - Dec 31."""
     today = today or datetime.now(timezone.utc).date()
     if style == "calendar":
+        if override and not re.fullmatch(r"\d{4}", override):
+            return None                                     # a 2025-2026 override does not apply to calendar leagues
         y = int(override) if override else today.year
         return date(y, 1, 1), date(y, 12, 31), str(y)
     if override:
-        m = re.fullmatch(r"(\d{4})-(\d{4})", override) or sys.exit("--season must look like 2025-2026")
-        y = int(m.group(1))
+        if not re.fullmatch(r"\d{4}-\d{4}", override):
+            return None                                     # a plain year does not apply to split leagues
+        y = int(override[:4])
     else:
         y = today.year if today.month >= 7 else today.year - 1
     return date(y, 7, 1), date(y + 1, 6, 30), f"{y}/{str(y + 1)[2:]}"
@@ -269,8 +278,43 @@ def load(url, cfg, label, rows, force, create_table, ev_rows=(), ev_ids=()):
 
 
 # ------------------------------------------------------------------ main
+def known_team_ids():
+    path = os.path.join(HERE, "teams.csv")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8", newline="") as fh:
+        return {r["teamId"] for r in csv.DictReader(fh)}
+
+
+def report_unknown_teams(rows, known):
+    """Warn about teams that are not in teams.csv (no logo / colours on the site until it is refreshed)."""
+    if not known:
+        return
+    ix_id, ix_name = COLUMNS.index("home_team_id"), COLUMNS.index("home_team_name")
+    missing = {}
+    for r in rows:
+        for i, n in ((ix_id, ix_name), (ix_id + 1, ix_name + 2)):
+            if r[i] not in known:
+                missing[r[i]] = r[n]
+    if missing:
+        print(f"  note: {len(missing)} team(s) not in teams.csv: "
+              + ", ".join(f"{n} ({i})" for i, n in sorted(missing.items())[:15]) + (" ..." if len(missing) > 15 else ""))
+
+
+def find_leagues(term):
+    """List ESPN soccer league slugs containing `term` (slug is the last path part of each $ref)."""
+    core = os.environ.get("ESPN_CORE", "https://sports.core.api.espn.com/v2/sports/soccer")
+    data = get_json(f"{core}/leagues?limit=1000")
+    slugs = sorted({re.search(r"/leagues/([^/?]+)", i["$ref"]).group(1) for i in data.get("items", []) if "$ref" in i})
+    hits = [s for s in slugs if term.lower() in s.lower()]
+    print(f"{len(slugs)} leagues known to ESPN; {len(hits)} match '{term}':")
+    for s in hits:
+        print("  ", s)
+
+
 def main():
     ap = argparse.ArgumentParser(description="ESPN API -> fixtures table")
+    ap.add_argument("--find", metavar="TEXT", help="list ESPN league slugs containing TEXT, then exit")
     ap.add_argument("--leagues", default=os.path.join(HERE, "leagues.json"))
     ap.add_argument("--league", help="only this ESPN slug, e.g. eng.1")
     ap.add_argument("--season", help="2025-2026 (split) or 2025 (calendar)")
@@ -278,6 +322,8 @@ def main():
     ap.add_argument("--create-table", action="store_true")
     ap.add_argument("--no-events", action="store_true", help="skip goals/cards (fixture_events)")
     args = ap.parse_args()
+    if args.find:
+        return find_leagues(args.find)
     url = os.environ.get("DATABASE_URL")
     if not url and not args.dry_run:
         sys.exit("Set DATABASE_URL or use --dry-run")
@@ -286,16 +332,22 @@ def main():
         leagues = [l for l in leagues if l["espn"] == args.league] or sys.exit(f"{args.league} not in leagues.json")
     force = os.environ.get("FORCE") == "1"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    failed = []
+    failed, warned = [], []
+    known = known_team_ids()
     for cfg in leagues:
-        start, end, label = season_bounds(cfg.get("season_style", "split"), override=args.season)
-        print(f"\n== {cfg['espn']} {label}", flush=True)
+        bounds = season_bounds(cfg.get("season_style", "split"), override=args.season)
+        if bounds is None:
+            print(f"\n== {cfg['espn']}: --season {args.season} does not fit its {cfg.get('season_style', 'split')} season, skipped")
+            continue
+        start, end, label = bounds
+        print(f"\n== {cfg['espn']} {cfg.get('name', '')} {label}", flush=True)
         try:
             rows = build_rows(fetch_events(cfg["espn"], start, end), cfg, label, now)
             if not rows:
                 print("  0 matches returned, skipping (nothing deleted)")
                 continue
             print(f"  {len(rows)} matches")
+            report_unknown_teams(rows, known)
             ev_rows, ev_ids = [], set()
             if not args.no_events:
                 skip = set() if args.dry_run else stored_event_ids(url, rows, args.create_table)
@@ -312,7 +364,12 @@ def main():
             else:
                 load(url, cfg, label, rows, force, args.create_table, ev_rows, ev_ids)
         except (Exception, SystemExit) as e:
-            print(f"  FAILED: {e}"); failed.append(cfg["espn"])
+            if cfg.get("optional"):
+                print(f"  WARNING (optional league, not loaded): {e}"); warned.append(cfg["espn"])
+            else:
+                print(f"  FAILED: {e}"); failed.append(cfg["espn"])
+    if warned:
+        print("\nOptional leagues that could not be loaded (check the slug with --find): " + ", ".join(warned))
     if failed:
         sys.exit("\nFailed: " + ", ".join(failed))
 

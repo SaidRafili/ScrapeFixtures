@@ -1,7 +1,25 @@
 [
-  {"espn": "eng.1", "comp_id": 9,  "season_style": "split"},
-  {"espn": "esp.1", "comp_id": 12, "season_style": "split"},
-  {"espn": "fra.1", "comp_id": 13, "season_style": "split"},
-  {"espn": "ger.1", "comp_id": 20, "season_style": "split"},
-  {"espn": "ita.1", "comp_id": 11, "season_style": "split"}
+  {"espn": "eng.1", "comp_id": 9,  "season_style": "split", "name": "Premier League"},
+  {"espn": "esp.1", "comp_id": 12, "season_style": "split", "name": "La Liga"},
+  {"espn": "fra.1", "comp_id": 13, "season_style": "split", "name": "Ligue 1"},
+  {"espn": "ger.1", "comp_id": 20, "season_style": "split", "name": "Bundesliga"},
+  {"espn": "ita.1", "comp_id": 11, "season_style": "split", "name": "Serie A"},
+
+  {"espn": "tur.1", "comp_id": 26,  "season_style": "split", "name": "Turkish Super Lig"},
+  {"espn": "aze.1", "comp_id": 301, "season_style": "split", "name": "Azerbaijan Premier League", "optional": true},
+
+  {"espn": "fifa.friendly",       "comp_id": 800, "season_style": "calendar", "name": "International Friendlies",        "optional": true},
+  {"espn": "fifa.world",          "comp_id": 801, "season_style": "calendar", "name": "FIFA World Cup",                  "optional": true},
+  {"espn": "fifa.worldq.uefa",    "comp_id": 802, "season_style": "calendar", "name": "World Cup Qualifying - UEFA",     "optional": true},
+  {"espn": "uefa.nations",        "comp_id": 803, "season_style": "calendar", "name": "UEFA Nations League",             "optional": true},
+  {"espn": "uefa.euro",           "comp_id": 804, "season_style": "calendar", "name": "UEFA European Championship",      "optional": true},
+  {"espn": "uefa.euroq",          "comp_id": 805, "season_style": "calendar", "name": "Euro Qualifying",                 "optional": true},
+  {"espn": "fifa.worldq.conmebol","comp_id": 806, "season_style": "calendar", "name": "World Cup Qualifying - CONMEBOL", "optional": true},
+  {"espn": "fifa.worldq.concacaf","comp_id": 807, "season_style": "calendar", "name": "World Cup Qualifying - CONCACAF", "optional": true},
+  {"espn": "fifa.worldq.caf",     "comp_id": 808, "season_style": "calendar", "name": "World Cup Qualifying - CAF",      "optional": true},
+  {"espn": "fifa.worldq.afc",     "comp_id": 809, "season_style": "calendar", "name": "World Cup Qualifying - AFC",      "optional": true},
+  {"espn": "conmebol.america",    "comp_id": 810, "season_style": "calendar", "name": "Copa America",                    "optional": true},
+  {"espn": "concacaf.gold",       "comp_id": 811, "season_style": "calendar", "name": "CONCACAF Gold Cup",               "optional": true},
+  {"espn": "caf.nations",         "comp_id": 812, "season_style": "calendar", "name": "Africa Cup of Nations",           "optional": true},
+  {"espn": "afc.asian.cup",       "comp_id": 813, "season_style": "calendar", "name": "AFC Asian Cup",                   "optional": true}
 ]

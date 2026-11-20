@@ -25,3 +25,13 @@ schedule, matches the teams to `teams.csv`, and loads everything into the SQL ta
   shrink by >20% vs the table (`FORCE=1` overrides).
 * Other leagues: soccerdata only knows its built-in FBref leagues; add custom ones via `league_dict.json`
   in `~/soccerdata/config/` (see the soccerdata docs).
+
+## ESPN sync (`sync_espn.py`, the one the workflow runs)
+`leagues.json` now covers the top-5 leagues, the Turkish Süper Lig (`tur.1`), and national-team competitions
+(`fifa.friendly`, World Cup + qualifiers, Nations League, Euro + qualifying, Copa America, AFCON, Asian Cup, Gold Cup).
+* National competitions use `"season_style": "calendar"` (label = year, e.g. `2026`) and `comp_id` 800+.
+* Entries with `"optional": true` only warn if ESPN rejects the slug, instead of failing the run.
+* Azerbaijan: ESPN does not appear to carry the Azerbaijan Premier League (only Qarabag via UEFA competitions),
+  so `aze.1` is a best-effort optional entry. Azerbaijan's national team is included via the competitions above.
+  Check with `python sync_espn.py --find aze`; if a real slug shows up, put it in `leagues.json`.
+* Clubs/teams missing from `teams.csv` are listed in the log (`note: N team(s) not in teams.csv`).
