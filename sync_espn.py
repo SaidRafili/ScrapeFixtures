@@ -18,6 +18,13 @@ leagues.json (one object per league):  {"espn": "eng.1", "comp_id": 9, "season_s
 
     python sync_espn.py --find azer       # list ESPN league slugs containing "azer" (to check a slug exists)
 
+    python sync_espn.py --upcoming                # window mode (what the scheduled run uses): last week + this week + next week only
+    python sync_espn.py --upcoming --weeks-back 0 --weeks-ahead 2
+
+--upcoming: weeks run Monday 00:00 UTC -> Monday 00:00 UTC (the same weeks the site's Predictions page uses). Only fixtures in the
+window are fetched and replaced (per league: DELETE + INSERT of that window in one transaction), so it is fast and the rest of the
+season is left alone. Last week is included so its final scores arrive (they decide the weekly leaderboard).
+
 --season: "2025-2026" applies to split leagues only, "2025" to calendar leagues only (others are skipped).
 
 Per league+season: DELETE + INSERT in ONE transaction. Skipped (nothing deleted) if the fetch fails, returns
@@ -25,7 +32,7 @@ Per league+season: DELETE + INSERT in ONE transaction. Skipped (nothing deleted)
 """
 import argparse, calendar, csv, json, os, re, sys, time
 import urllib.error, urllib.parse, urllib.request
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.environ.get("ESPN_BASE", "https://site.api.espn.com/apis/site/v2/sports/soccer")
@@ -77,6 +84,25 @@ def months(start, end):
     while (y, m) <= (end.year, end.month):
         yield y, m
         y, m = y + (m == 12), m % 12 + 1
+
+
+def week_window(back=1, ahead=1, now=None):
+    """-> (start, end) datetimes (UTC, end exclusive): `back` weeks before the current week up to the end of `ahead` weeks after it."""
+    now = now or datetime.now(timezone.utc)
+    monday = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) - timedelta(days=now.weekday())
+    return monday - timedelta(weeks=back), monday + timedelta(weeks=ahead + 1)
+
+
+def event_label(style, d):
+    """Season label of one match date (a window can straddle the July season change)."""
+    if style == "calendar":
+        return str(d.year)
+    y = d.year if d.month >= 7 else d.year - 1
+    return f"{y}/{str(y + 1)[2:]}"
+
+
+def ts_text(d):
+    return d.strftime("%Y-%m-%d %H:%M:%S+00")
 
 
 # ------------------------------------------------------------------ fetch
@@ -135,6 +161,21 @@ def fetch_events(slug, start, end):
     return list(events.values())
 
 
+def fetch_window(slug, start, end):
+    """Events whose kick-off is in [start, end): fetches the months the window touches, keeps only the window."""
+    events = {}
+    for y, m in months(start.date(), (end - timedelta(seconds=1)).date()):
+        for ev in fetch_month(slug, y, m):
+            try:
+                d = datetime.fromisoformat(ev["date"].replace("Z", "+00:00")).astimezone(timezone.utc)
+            except (KeyError, ValueError):
+                continue
+            if start <= d < end:
+                events[str(ev["id"])] = ev
+        time.sleep(0.3)
+    return list(events.values())
+
+
 # ------------------------------------------------------------------ parse
 def num(v):
     try:
@@ -174,6 +215,26 @@ def build_rows(events, cfg, label, now):
     base = int(cfg["comp_id"]) * 10000
     for i, r in enumerate(rows, 1):                         # rn: stable position by ESPN event id
         r[0] = base + i
+    return [[None if v in (None, "") else str(v) for v in r] for r in rows]
+
+
+def build_window_rows(events, cfg, now, rn_map, top_rn):
+    """Like build_rows, but the season label comes from each match's own date and `rn` keeps the value a row already has in the
+    table (new matches get top_rn + 1, +2 ...), so rows outside the window never collide with these."""
+    style = cfg.get("season_style", "split")
+    rows = []
+    for e in events:
+        d = datetime.fromisoformat(e["date"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        r = parse_event(e, cfg, event_label(style, d), now)
+        if r:
+            rows.append(r)
+    rows.sort(key=lambda r: (int(r[3]) if str(r[3]).isdigit() else 0, r[3]))
+    for r in rows:
+        if r[3] in rn_map:
+            r[0] = rn_map[r[3]]
+        else:
+            top_rn += 1
+            r[0] = top_rn
     return [[None if v in (None, "") else str(v) for v in r] for r in rows]
 
 
@@ -277,6 +338,49 @@ def load(url, cfg, label, rows, force, create_table, ev_rows=(), ev_ids=()):
     print(f"  loaded {played} finished + {len(rows) - played} other, {len(ev_rows)} goal/card events for {len(ev_ids)} matches")
 
 
+def existing_rn(url, cfg):
+    """-> ({event_id: rn} already in the table for this league, highest rn in use)."""
+    base = int(cfg["comp_id"]) * 10000
+    if not url:
+        return {}, base
+    import psycopg
+    with psycopg.connect(url) as conn:
+        got = conn.execute('SELECT "event_id", "rn" FROM "fixtures" WHERE "league_id" = %s', (str(cfg["comp_id"]),)).fetchall()
+    rn_map = {e: r for e, r in got if r}
+    return rn_map, max([int(r) for r in rn_map.values() if str(r).isdigit()] or [base])
+
+
+def load_window(url, cfg, rows, start, end, force, create_table, ev_rows=(), ev_ids=()):
+    """Replace this league's fixtures inside [start, end) only. Matches that moved out of the window are removed by event id."""
+    import psycopg
+    played = sum(r[COLUMNS.index("status_id")] in FINISHED for r in rows)
+    lo, hi = ts_text(start), ts_text(end)
+    with psycopg.connect(url) as conn:
+        if create_table:
+            conn.execute(DDL)
+            conn.execute(EVENTS_DDL)
+        conn.execute('ALTER TABLE "fixtures" ALTER COLUMN "home_team_abbr" TYPE varchar(10), '
+                     'ALTER COLUMN "away_team_abbr" TYPE varchar(10)')
+        league = str(cfg["comp_id"])
+        if not force:
+            old = conn.execute('SELECT count(*) FROM "fixtures" WHERE "league_id" = %s AND "date" >= %s AND "date" < %s '
+                               'AND "status_id" = ANY(%s)', (league, lo, hi, list(FINISHED))).fetchone()[0]
+            if old and played < old * 0.8:
+                print(f"  finished in the window would drop {old} -> {played}; skipping. Re-run with FORCE=1 if that is right.")
+                return
+        conn.execute('DELETE FROM "fixtures" WHERE "league_id" = %s AND (("date" >= %s AND "date" < %s) OR "event_id" = ANY(%s))',
+                     (league, lo, hi, [r[3] for r in rows]))
+        cols = ", ".join(f'"{c}"' for c in COLUMNS)
+        with conn.cursor() as cur:
+            cur.executemany(f'INSERT INTO "fixtures" ({cols}) VALUES ({", ".join(["%s"] * len(COLUMNS))})', rows)
+        if ev_ids:
+            conn.execute('DELETE FROM "fixture_events" WHERE "event_id" = ANY(%s)', (list(ev_ids),))
+            with conn.cursor() as cur:
+                cur.executemany('INSERT INTO "fixture_events" ("event_id","team_side","minute","event_type","player","assist") '
+                                'VALUES (%s,%s,%s,%s,%s,%s)', ev_rows)
+    print(f"  window loaded: {played} finished + {len(rows) - played} upcoming/other, {len(ev_rows)} goal/card events for {len(ev_ids)} matches")
+
+
 # ------------------------------------------------------------------ main
 def known_team_ids():
     path = os.path.join(HERE, "teams.csv")
@@ -318,6 +422,9 @@ def main():
     ap.add_argument("--leagues", default=os.path.join(HERE, "leagues.json"))
     ap.add_argument("--league", help="only this ESPN slug, e.g. eng.1")
     ap.add_argument("--season", help="2025-2026 (split) or 2025 (calendar)")
+    ap.add_argument("--upcoming", action="store_true", help="window mode: only last week + this week + next week (Mon-Mon UTC)")
+    ap.add_argument("--weeks-back", type=int, default=1, help="with --upcoming: whole weeks before this one to refresh (default 1)")
+    ap.add_argument("--weeks-ahead", type=int, default=1, help="with --upcoming: whole weeks after this one to fetch (default 1)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--create-table", action="store_true")
     ap.add_argument("--no-events", action="store_true", help="skip goals/cards (fixture_events)")
@@ -334,15 +441,25 @@ def main():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     failed, warned = [], []
     known = known_team_ids()
+    win = week_window(max(args.weeks_back, 0), max(args.weeks_ahead, 0)) if args.upcoming else None
+    if win:
+        print(f"Window mode: {ts_text(win[0])} -> {ts_text(win[1])} (UTC, end exclusive)")
     for cfg in leagues:
-        bounds = season_bounds(cfg.get("season_style", "split"), override=args.season)
-        if bounds is None:
-            print(f"\n== {cfg['espn']}: --season {args.season} does not fit its {cfg.get('season_style', 'split')} season, skipped")
-            continue
-        start, end, label = bounds
+        if win:
+            label = f"{win[0]:%Y-%m-%d} .. {win[1]:%Y-%m-%d}"
+        else:
+            bounds = season_bounds(cfg.get("season_style", "split"), override=args.season)
+            if bounds is None:
+                print(f"\n== {cfg['espn']}: --season {args.season} does not fit its {cfg.get('season_style', 'split')} season, skipped")
+                continue
+            start, end, label = bounds
         print(f"\n== {cfg['espn']} {cfg.get('name', '')} {label}", flush=True)
         try:
-            rows = build_rows(fetch_events(cfg["espn"], start, end), cfg, label, now)
+            if win:
+                rn_map, top = existing_rn(None if args.dry_run else url, cfg)
+                rows = build_window_rows(fetch_window(cfg["espn"], *win), cfg, now, rn_map, top)
+            else:
+                rows = build_rows(fetch_events(cfg["espn"], start, end), cfg, label, now)
             if not rows:
                 print("  0 matches returned, skipping (nothing deleted)")
                 continue
@@ -361,6 +478,8 @@ def main():
                 if ev_rows:
                     with open(os.path.join(HERE, "out", re.sub(r"\W+", "_", cfg["espn"]) + "_events.csv"), "w", newline="", encoding="utf-8") as fh:
                         w = csv.writer(fh); w.writerow(EVENT_COLUMNS); w.writerows(ev_rows)
+            elif win:
+                load_window(url, cfg, rows, win[0], win[1], force, args.create_table, ev_rows, ev_ids)
             else:
                 load(url, cfg, label, rows, force, args.create_table, ev_rows, ev_ids)
         except (Exception, SystemExit) as e:

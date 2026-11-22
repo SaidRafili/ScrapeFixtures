@@ -2,9 +2,14 @@ name: ESPN -> fixtures sync
 
 on:
   schedule:
-    - cron: "17 5,17 * * *"      # twice a day (05:17 and 17:17 UTC)
+    - cron: "0 0,12 * * *"       # twice a day: 12:00 am and 12:00 pm UTC (GitHub may start it a few minutes late)
   workflow_dispatch:
     inputs:
+      mode:
+        description: "upcoming = last/this/next week only (fast); full = whole season of every league"
+        type: choice
+        options: [upcoming, full]
+        default: upcoming
       force:
         description: "Skip the shrink safety check (FORCE=1)"
         type: boolean
@@ -28,4 +33,6 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FORCE: ${{ inputs.force && '1' || '0' }}
-        run: python sync_espn.py
+          MODE: ${{ inputs.mode || 'upcoming' }}      # scheduled runs have no inputs -> upcoming
+        run: |
+          if [ "$MODE" = "full" ]; then python sync_espn.py; else python sync_espn.py --upcoming; fi
