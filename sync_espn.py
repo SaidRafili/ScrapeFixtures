@@ -21,7 +21,7 @@ leagues.json (one object per league):  {"espn": "eng.1", "comp_id": 9, "season_s
     python sync_espn.py --upcoming                # window mode (what the scheduled run uses): last week + this week + next week only
     python sync_espn.py --upcoming --weeks-back 0 --weeks-ahead 2
 
---upcoming: weeks run Monday 00:00 UTC -> Monday 00:00 UTC (the same weeks the site's Predictions page uses). Only fixtures in the
+--upcoming: weeks run Monday 00:00 -> Monday 00:00 in Baku time (WEEK_OFFSET_HOURS, the same weeks the site's Predictions page uses). Only fixtures in the
 window are fetched and replaced (per league: DELETE + INSERT of that window in one transaction), so it is fast and the rest of the
 season is left alone. Last week is included so its final scores arrive (they decide the weekly leaderboard).
 
@@ -86,10 +86,14 @@ def months(start, end):
         y, m = y + (m == 12), m % 12 + 1
 
 
+WEEK_OFFSET_HOURS = 4      # weeks start Monday 00:00 in this zone (4 = Baku, UTC+4). Keep equal to WEEK_OFFSET_HOURS in Futlog's lib/predictions.js
+
+
 def week_window(back=1, ahead=1, now=None):
     """-> (start, end) datetimes (UTC, end exclusive): `back` weeks before the current week up to the end of `ahead` weeks after it."""
-    now = now or datetime.now(timezone.utc)
-    monday = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) - timedelta(days=now.weekday())
+    off = timedelta(hours=WEEK_OFFSET_HOURS)
+    local = (now or datetime.now(timezone.utc)) + off                      # clock time in the week zone
+    monday = datetime(local.year, local.month, local.day, tzinfo=timezone.utc) - timedelta(days=local.weekday()) - off
     return monday - timedelta(weeks=back), monday + timedelta(weeks=ahead + 1)
 
 
