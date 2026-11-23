@@ -39,4 +39,7 @@ jobs:
           REPLACE: ${{ inputs.replace_external && '--replace-external' || '' }}
         run: |
           if [ "${{ inputs.shrink }}" = "true" ]; then python sync_venue_photos.py --shrink
-          else python sync_venue_photos.py --limit "$LIMIT" $REPLACE; fi
+          else
+            python sync_venue_photos.py --national --limit 0 $REPLACE      # grounds of national-team matches first (few matches each, so a busiest-first run would never reach them)
+            python sync_venue_photos.py --limit "$LIMIT" $REPLACE
+          fi

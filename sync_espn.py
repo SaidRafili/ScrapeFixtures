@@ -25,7 +25,9 @@ leagues.json (one object per league):  {"espn": "eng.1", "comp_id": 9, "season_s
 window are fetched and replaced (per league: DELETE + INSERT of that window in one transaction), so it is fast and the rest of the
 season is left alone. Last week is included so its final scores arrive (they decide the weekly leaderboard).
 
---season: "2025-2026" applies to split leagues only, "2025" to calendar leagues only (others are skipped).
+--season: "2025-2026" applies to split leagues only, "2025" to calendar leagues only (others are skipped). Without it only the CURRENT season / year is
+loaded, so older national-team matches (e.g. France's 2025 World Cup qualifiers) need a backfill:  python sync_espn.py --season 2024,2025,2025-2026
+Several values run one after the other (several seasons of every league, not just the national ones; add --league fifa.friendly to limit it).
 
 Leagues: each league's name and logo are read from ESPN's scoreboard (leagues.json "name" is only the fallback) and saved in `leagues`, so the site shows
 "FIFA World Cup" instead of "League 801". Existing real names are never overwritten.
@@ -513,7 +515,7 @@ def main():
     ap.add_argument("--find", metavar="TEXT", help="list ESPN league slugs containing TEXT, then exit")
     ap.add_argument("--leagues", default=os.path.join(HERE, "leagues.json"))
     ap.add_argument("--league", help="only this ESPN slug, e.g. eng.1")
-    ap.add_argument("--season", help="2025-2026 (split) or 2025 (calendar)")
+    ap.add_argument("--season", help="2025-2026 (split) or 2025 (calendar); several: 2024,2025,2025-2026")
     ap.add_argument("--upcoming", action="store_true", help="window mode: only last week + this week + next week (Mon-Mon UTC)")
     ap.add_argument("--weeks-back", type=int, default=1, help="with --upcoming: whole weeks before this one to refresh (default 1)")
     ap.add_argument("--weeks-ahead", type=int, default=1, help="with --upcoming: whole weeks after this one to fetch (default 1)")
@@ -521,6 +523,21 @@ def main():
     ap.add_argument("--create-table", action="store_true")
     ap.add_argument("--no-events", action="store_true", help="skip goals/cards (fixture_events)")
     args = ap.parse_args()
+    if args.season and "," in args.season:                  # --season 2024,2025,2026 or 2025,2025-2026: one run per season
+        import subprocess
+        rest, skip = [], False
+        for a in sys.argv[1:]:
+            if skip:
+                skip = False
+            elif a == "--season":
+                skip = True
+            elif not a.startswith("--season="):
+                rest.append(a)
+        rc = 0
+        for one in [x.strip() for x in args.season.split(",") if x.strip()]:
+            print(f"\n######## season {one}", flush=True)
+            rc = subprocess.run([sys.executable, os.path.abspath(__file__), *rest, "--season", one]).returncode or rc
+        sys.exit(rc)
     if args.find:
         return find_leagues(args.find)
     url = os.environ.get("DATABASE_URL")

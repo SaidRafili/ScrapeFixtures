@@ -4,6 +4,7 @@ sync_venue_photos.py - find a stadium photo on Wikipedia / Wikimedia Commons for
 
     DATABASE_URL=postgres://... python sync_venue_photos.py --limit 150      # venues without a photo, busiest venues first
     python sync_venue_photos.py --dry-run                                    # print what would be saved, write ./out/venue_photos.csv
+    python sync_venue_photos.py --national --limit 0                         # grounds of national-team matches (league ids 800+), all of them
     python sync_venue_photos.py --lookup "Emirates Stadium"                  # test the search on one name, no database needed
     python sync_venue_photos.py --csv venues.csv --dry-run                   # read venues from a CSV (venueid,fullname,photourl,photocredit)
     python sync_venue_photos.py --shrink                                     # rewrite photo links that are already saved, e.g. 3840px -> 1280px
@@ -195,19 +196,40 @@ def load_rows_csv(path):
         return [dict(venueid=int(r["venueid"]), fullname=r["fullname"], photourl=r.get("photourl") or "", n=0) for r in csv.DictReader(fh)]
 
 
-def db_rows(cur, replace_external, retry_days, limit, only):
+def db_rows(cur, replace_external, retry_days, limit, only, league_ids=None, min_league=None):
+    """Venues to look up, busiest first. league_ids / min_league keep only venues that host fixtures of those leagues (national competitions
+    have comp_id >= 800), so a few hundred busy club grounds can not push the national stadiums out of a limited run."""
     cur.execute("""CREATE TABLE IF NOT EXISTS venue_photo_misses (venueid integer PRIMARY KEY, tried_at timestamptz NOT NULL DEFAULT now(), reason text)""")
     cur.execute("SELECT to_regclass('public.fixtures') IS NOT NULL")
     has_fx = cur.fetchone()[0]
+    if (league_ids or min_league) and not has_fx:
+        sys.exit("--national / --league-ids need the fixtures table")
+    has_home = False
+    if has_fx:
+        cur.execute("""SELECT count(*) FROM information_schema.columns WHERE table_name = 'fixtures' AND column_name = 'home_team_name' AND table_schema = ANY (current_schemas(false))""")
+        has_home = cur.fetchone()[0] > 0
     join = 'LEFT JOIN "fixtures" f ON f.venue_id = v.venueid::text' if has_fx else ""
     cnt = "count(f.event_id)" if has_fx else "0"
+    home = "mode() WITHIN GROUP (ORDER BY f.home_team_name)" if has_home else "NULL"      # the team that plays there most: tells two "Estadio Nacional" apart
     cond = "v.photourl = ''" + (r" OR (v.photourl ~ '^https?://' AND v.photourl !~ '^https://(upload|thumb)\.wikimedia\.org/')" if replace_external else "")
-    cur.execute(f"""SELECT v.venueid, v.fullname, v.photourl, {cnt} AS n FROM "venues" v {join}
-                     WHERE v.fullname <> '' AND ({cond}) AND (%(only)s::int IS NOT NULL AND v.venueid = %(only)s
+    lid = "CASE WHEN f.league_id ~ '^[0-9]+$' THEN f.league_id::int END"
+    league = (f" AND {lid} = ANY(%(lids)s)" if league_ids else "") + (f" AND {lid} >= %(minl)s" if min_league else "")
+    cur.execute(f"""SELECT v.venueid, v.fullname, v.photourl, {cnt} AS n, {home} AS home FROM "venues" v {join}
+                     WHERE v.fullname <> '' AND ({cond}){league} AND (%(only)s::int IS NOT NULL AND v.venueid = %(only)s
                         OR %(only)s::int IS NULL AND v.venueid NOT IN (SELECT venueid FROM venue_photo_misses WHERE tried_at > now() - make_interval(days => %(days)s)))
-                     GROUP BY v.venueid, v.fullname, v.photourl ORDER BY n DESC, v.venueid LIMIT %(limit)s""",
-                {"only": only, "days": retry_days, "limit": limit})
-    return [dict(venueid=r[0], fullname=r[1], photourl=r[2], n=r[3]) for r in cur.fetchall()]
+                     GROUP BY v.venueid, v.fullname, v.photourl ORDER BY n DESC, v.venueid LIMIT NULLIF(%(limit)s, 0)""",
+                {"only": only, "days": retry_days, "limit": limit, "lids": league_ids or [], "minl": min_league or 0})
+    return [dict(venueid=r[0], fullname=r[1], photourl=r[2], n=r[3], home=r[4]) for r in cur.fetchall()]
+
+
+def parse_ids(text):
+    """'800-813,9' -> [9, 800, 801, ... 813]"""
+    out = set()
+    for part in str(text).split(","):
+        a, _, b = part.strip().partition("-")
+        if a.strip():
+            out.update(range(int(a), int(b or a) + 1))
+    return sorted(out)
 
 
 def main():
@@ -216,7 +238,9 @@ def main():
     ap.add_argument("--team", help="with --lookup: a team that plays there")
     ap.add_argument("--csv", help="read venues from this CSV instead of the database (use with --dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="do not write to the database; write ./out/venue_photos.csv")
-    ap.add_argument("--limit", type=int, default=150, help="venues to look up per run (default 150)")
+    ap.add_argument("--limit", type=int, default=150, help="venues to look up per run (default 150, 0 = all)")
+    ap.add_argument("--national", action="store_true", help="only venues that host national-team competitions (league ids 800 and up)")
+    ap.add_argument("--league-ids", help="only venues that host fixtures of these league ids, e.g. 800-813 or 9,12")
     ap.add_argument("--only", type=int, help="one venueid")
     ap.add_argument("--width", type=int, default=1280, choices=STEPS, help="thumbnail width to save (default 1280)")
     ap.add_argument("--replace-external", action="store_true", help="also look for Wikipedia photos for venues whose photo is on another site")
@@ -253,13 +277,15 @@ def main():
     else:
         import psycopg
         conn = psycopg.connect(url, autocommit=True)
-        rows = db_rows(conn.cursor(), args.replace_external, args.retry_days, args.limit, args.only)
+        rows = db_rows(conn.cursor(), args.replace_external, args.retry_days, args.limit, args.only,
+                       parse_ids(args.league_ids) if args.league_ids else None, 800 if args.national else None)
     print(f"{len(rows)} venue(s) to look up" + (" (dry run)" if args.dry_run else ""), flush=True)
 
     out, found, missed = [], 0, 0
     for v in rows:
         try:
-            r = find_photo(v["fullname"], teams.get(v["venueid"], [])[:3], args.width)
+            ctx = ([v["home"]] if v.get("home") else []) + [t for t in teams.get(v["venueid"], []) if t != v.get("home")]
+            r = find_photo(v["fullname"], ctx[:3], args.width)
         except Exception as e:                              # noqa: BLE001 - one bad venue must not stop the run
             r = {"miss": f"error: {e}"}
         if r.get("url"):

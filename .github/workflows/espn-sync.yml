@@ -10,6 +10,9 @@ on:
         type: choice
         options: [upcoming, full]
         default: upcoming
+      season:
+        description: "Backfill: season(s) to load, e.g. 2025 or 2024,2025,2025-2026 (leave empty for the current season). Use with mode=full"
+        default: ""
       force:
         description: "Skip the shrink safety check (FORCE=1)"
         type: boolean
@@ -34,5 +37,8 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FORCE: ${{ inputs.force && '1' || '0' }}
           MODE: ${{ inputs.mode || 'upcoming' }}      # scheduled runs have no inputs -> upcoming
+          SEASON: ${{ inputs.season || '' }}
         run: |
-          if [ "$MODE" = "full" ]; then python sync_espn.py; else python sync_espn.py --upcoming; fi
+          if [ "$MODE" = "full" ]; then
+            if [ -n "$SEASON" ]; then python sync_espn.py --season "$SEASON"; else python sync_espn.py; fi
+          else python sync_espn.py --upcoming; fi

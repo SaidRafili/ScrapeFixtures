@@ -59,3 +59,22 @@ a blank or "League 801"-style row is filled in. `--dry-run` writes `out/leagues.
 Venues with no match are remembered in `venue_photo_misses` and retried after 60 days. Set `WIKI_UA="Your site (you@example.com)"` (Wikimedia asks for
 a contact). GitHub: `venue-photos.yml` runs it weekly (secrets: `DATABASE_URL`, optional `WIKI_UA`). **Always spot-check the first results**: a search can
 pick the wrong stadium; fix one with `UPDATE venues SET photourl='...', photocredit='...' WHERE venueid=...`.
+
+## A team's matches are missing (e.g. France)
+Which seasons are loaded: a normal run loads only the **current** season (national competitions: the current calendar year) and the scheduled run
+(`--upcoming`) only last week + this week + next week. Older matches need a one-off backfill:
+
+    python sync_espn.py --season 2024,2025,2025-2026          # several seasons, one after the other (add --league fifa.friendly to limit it)
+    # GitHub: Actions -> "ESPN -> fixtures sync" -> Run workflow -> mode: full, season: 2024,2025,2025-2026
+
+To see what the database has for a team (France = 478; the women's team is 2755), run:
+
+    SELECT league_id, season_type, count(*) AS matches, min(date), max(date)
+      FROM fixtures WHERE '478' IN (home_team_id, away_team_id) GROUP BY 1, 2 ORDER BY 2 DESC, 1;
+
+* No rows for a season/league -> they were never loaded: backfill as above.
+* Rows exist but the site does not show them -> the site only lists FINISHED matches (status 28 / 45 / 46 / 47) and has to match the fixture's team
+  id to a row of `teams` (Futlog `resolveTeams`, which prefers the team's home ground); check the match status and that team 478 is in `teams`.
+
+National venue photos: `python sync_venue_photos.py --national --limit 0` looks up every ground used by a national competition (league ids 800+)
+first; the weekly workflow does this before the general run.
