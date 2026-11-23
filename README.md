@@ -36,11 +36,16 @@ schedule, matches the teams to `teams.csv`, and loads everything into the SQL ta
   Check with `python sync_espn.py --find aze`; if a real slug shows up, put it in `leagues.json`.
 * Clubs/teams missing from `teams.csv` are listed in the log (`note: N team(s) not in teams.csv`).
 
+## League names (`leagues` table)
+`sync_espn.py` reads each league's name and logo from ESPN's own scoreboard response and saves them in `leagues` (`leagues.json` `"name"` is only the
+fallback), so new competitions show "FIFA World Cup" instead of "League 801" with no manual step. A real name already in the table is never overwritten;
+a blank or "League 801"-style row is filled in. `--dry-run` writes `out/leagues.csv`.
+
 ## Venue names + photos (`venues` table)
 `venues` = `venueid`, `fullname`, `photourl`, `photocredit`. Two steps fill it:
 1. **`sync_espn.py` saves every venue it sees** (id + name from the ESPN scoreboard, `INSERT ... ON CONFLICT DO NOTHING`, so a name or photo you
-   corrected by hand is never overwritten). `--dry-run` writes `out/venues.csv`. Venues of teams that play in none of the leagues in `leagues.json`
-   are not seen, so they get no row (and no photo).
+   corrected by hand is never overwritten). `--dry-run` writes `out/venues.csv`. International matches (friendlies, qualifiers...) often arrive with a venue name but no venue id: those get a stable id
+   made from the name, so national-team grounds are saved too. Venues of teams that play in none of the leagues in `leagues.json` are not seen.
 2. **`sync_venue_photos.py` finds a photo on Wikipedia / Wikimedia Commons** and saves Wikimedia's own *thumbnail* link (1280px by default, never the
    multi-MB original) plus the author/licence line in `photocredit`. Only free Commons files are used, never logos/crests/maps.
 

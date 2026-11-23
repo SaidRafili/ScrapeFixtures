@@ -27,13 +27,17 @@ season is left alone. Last week is included so its final scores arrive (they dec
 
 --season: "2025-2026" applies to split leagues only, "2025" to calendar leagues only (others are skipped).
 
-Venues: every venue id in the scoreboards is also saved (id + name) in `venues` (never overwriting a row), so each match shows its stadium;
+Leagues: each league's name and logo are read from ESPN's scoreboard (leagues.json "name" is only the fallback) and saved in `leagues`, so the site shows
+"FIFA World Cup" instead of "League 801". Existing real names are never overwritten.
+
+Venues: every venue id in the scoreboards is also saved (id + name) in `venues` (never overwriting a row), so each match shows its stadium. International matches often come without a venue id: those get a stable
+id of our own made from the venue name (synthetic_venue_id), so national-team grounds are saved too;
 sync_venue_photos.py then adds the photos.
 
 Per league+season: DELETE + INSERT in ONE transaction. Skipped (nothing deleted) if the fetch fails, returns
 0 matches, or finished matches would shrink >20% vs the table (FORCE=1 overrides).
 """
-import argparse, calendar, csv, json, os, re, sys, time
+import argparse, calendar, csv, json, os, re, sys, time, zlib
 import urllib.error, urllib.parse, urllib.request
 from datetime import date, datetime, timedelta, timezone
 
@@ -67,6 +71,15 @@ VENUES_DDL = """CREATE TABLE IF NOT EXISTS "venues" (
 \t"photourl" varchar(500) DEFAULT '' NOT NULL,
 \t"photocredit" varchar(255) DEFAULT '' NOT NULL
 );"""
+LEAGUES_DDL = """CREATE TABLE IF NOT EXISTS "leagues" (
+\t"leagueid" integer PRIMARY KEY,
+\t"name" varchar(100) NOT NULL,
+\t"shortname" varchar(50) NOT NULL,
+\t"season" varchar(20) NOT NULL,
+\t"logourl" varchar(255) NOT NULL,
+\t"slug" varchar(100) NOT NULL
+);"""
+LEAGUE_INFO = {}       # ESPN slug -> the "leagues[0]" object of its scoreboard (name, abbreviation, logos); saved by save_leagues()
 VENUES = {}            # venue id -> name, collected from every scoreboard event we parse; saved by save_venues()
 RECENT_DAYS = 3        # finished matches this recent are re-fetched every run (VAR / late corrections)
 
@@ -137,7 +150,11 @@ def get_json(url, tries=4):
         time.sleep(3 * i)
 
 
-def _events(data):
+def _events(data, slug=None):
+    if slug and slug not in LEAGUE_INFO:
+        lg = (data.get("leagues") or [None])[0]             # ESPN sends the league's own name + logo with every scoreboard
+        if isinstance(lg, dict) and lg.get("name"):
+            LEAGUE_INFO[slug] = lg
     return data.get("events") or []
 
 
@@ -147,7 +164,7 @@ def fetch_month(slug, y, m):
     url = f"{BASE}/{slug}/scoreboard?dates={y}{m:02d}"
     for extra, cap in (("&limit=1000", 1000), ("", 100)):
         try:
-            evs = _events(get_json(url + extra))
+            evs = _events(get_json(url + extra), slug)
         except urllib.error.HTTPError as e:
             if e.code != 400:
                 raise RuntimeError(f"{url}{extra}: {e}")
@@ -159,7 +176,7 @@ def fetch_month(slug, y, m):
     out = []
     for day in range(1, calendar.monthrange(y, m)[1] + 1):
         try:
-            out += _events(get_json(f"{BASE}/{slug}/scoreboard?dates={y}{m:02d}{day:02d}"))
+            out += _events(get_json(f"{BASE}/{slug}/scoreboard?dates={y}{m:02d}{day:02d}"), slug)
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"{slug} {y}{m:02d}{day:02d}: {e}")
         time.sleep(0.2)
@@ -191,6 +208,12 @@ def fetch_window(slug, start, end):
 
 
 # ------------------------------------------------------------------ parse
+def synthetic_venue_id(name):
+    """ESPN often sends international matches (friendlies, qualifiers) with a venue NAME but no venue id. Rather than lose the venue, give it a
+    stable id of our own from the name (1.0 - 2.0 billion, far above ESPN's real ids), so the same ground always gets the same id."""
+    return 1_000_000_000 + zlib.crc32(name.lower().encode("utf-8")) % 1_000_000_000
+
+
 def num(v):
     try:
         return str(int(float(v)))
@@ -216,9 +239,11 @@ def parse_event(ev, cfg, label, now):
     if st.get("completed"):
         hw, aw = str(bool(h.get("winner"))).lower(), str(bool(a.get("winner"))).lower()
     ven = comp.get("venue") or {}
-    if str(ven.get("id") or "").isdigit() and (ven.get("fullName") or "").strip():
-        VENUES[int(ven["id"])] = " ".join(ven["fullName"].split())[:150]
-    return [None, label, cfg["comp_id"], ev["id"], d.strftime("%Y-%m-%d %H:%M:%S+00"), ven.get("id"),
+    vname = " ".join(str(ven.get("fullName") or "").split())[:150]
+    vid = ven.get("id") if str(ven.get("id") or "").isdigit() else (synthetic_venue_id(vname) if vname else None)
+    if vid and vname:
+        VENUES[int(vid)] = vname
+    return [None, label, cfg["comp_id"], ev["id"], d.strftime("%Y-%m-%d %H:%M:%S+00"), vid,
             num(comp.get("attendance")) if started and comp.get("attendance") else None,
             ht["id"], at["id"], hw, aw, hs, as_, num(h.get("shootoutScore")), num(a.get("shootoutScore")),
             st.get("id") or "1", now, ht.get("abbreviation"), ht.get("displayName") or ht.get("name"),
@@ -398,6 +423,40 @@ def load_window(url, cfg, rows, start, end, force, create_table, ev_rows=(), ev_
 
 
 # ------------------------------------------------------------------ main
+def league_rows(leagues):
+    """[(comp_id, name, shortname, season, logo, slug)] for the leagues of this run: ESPN's own name first, leagues.json "name" as fallback."""
+    out = []
+    for cfg in leagues:
+        info = LEAGUE_INFO.get(cfg["espn"]) or {}
+        name = " ".join(str(info.get("name") or cfg.get("name") or "").split())[:100]
+        if not name:
+            continue
+        logos = [l for l in info.get("logos") or [] if l.get("href")]
+        logo = next((l["href"] for l in logos if "default" in (l.get("rel") or [])), logos[0]["href"] if logos else "")
+        short = " ".join(str(info.get("abbreviation") or name).split())[:50]
+        out.append((int(cfg["comp_id"]), name, short, "", logo[:255], cfg["espn"][:100]))
+    return out
+
+
+def save_leagues(url, rows):
+    """Add each league's name / logo to `leagues` (read by the site as "Premier League" instead of "League 9"). A row that already has a real name is
+    left alone; a blank or placeholder ("League 801") one is filled in. Own connection, so a failure here never affects the fixtures."""
+    if not rows:
+        return
+    import psycopg
+    try:
+        with psycopg.connect(url) as conn, conn.cursor() as cur:
+            cur.execute(LEAGUES_DDL)
+            cur.executemany("""INSERT INTO "leagues" ("leagueid", "name", "shortname", "season", "logourl", "slug") VALUES (%s, %s, %s, %s, %s, %s)
+                               ON CONFLICT ("leagueid") DO UPDATE SET "name" = EXCLUDED."name", "shortname" = EXCLUDED."shortname",
+                                 "logourl" = CASE WHEN "leagues"."logourl" = '' THEN EXCLUDED."logourl" ELSE "leagues"."logourl" END,
+                                 "slug" = CASE WHEN "leagues"."slug" = '' THEN EXCLUDED."slug" ELSE "leagues"."slug" END
+                               WHERE "leagues"."name" = '' OR "leagues"."name" ~ '^League [0-9]+$'""", rows)
+            print(f"\nleagues: {len(rows)} named (rows that already had a real name are untouched)")
+    except Exception as e:                                  # noqa: BLE001 - never fail the run over league names
+        print(f"\nWARNING: leagues not saved: {e}")
+
+
 def save_venues(url):
     """Add every venue seen in the scoreboards to `venues` (id + name) so the site can show the stadium name and sync_venue_photos.py
     has something to look up. Existing rows are never touched (a hand-corrected name or a photo stays). Own connection: if the table is
@@ -520,6 +579,15 @@ def main():
                 print(f"  WARNING (optional league, not loaded): {e}"); warned.append(cfg["espn"])
             else:
                 print(f"  FAILED: {e}"); failed.append(cfg["espn"])
+    lrows = league_rows(leagues)
+    if lrows:
+        if args.dry_run:
+            os.makedirs(os.path.join(HERE, "out"), exist_ok=True)
+            with open(os.path.join(HERE, "out", "leagues.csv"), "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh); w.writerow(["leagueid", "name", "shortname", "season", "logourl", "slug"]); w.writerows(lrows)
+            print(f"\nwrote out/leagues.csv ({len(lrows)} leagues)")
+        else:
+            save_leagues(url, lrows)
     if VENUES:
         if args.dry_run:
             os.makedirs(os.path.join(HERE, "out"), exist_ok=True)
