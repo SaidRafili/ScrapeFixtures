@@ -1,0 +1,42 @@
+name: Venue photos (Wikipedia)
+
+on:
+  schedule:
+    - cron: "30 3 * * 0"          # weekly, Sunday 03:30 UTC (new venues appear as fixtures are synced)
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Venues to look up this run (busiest venues first)"
+        default: "150"
+      replace_external:
+        description: "Also try to replace photos hosted on other sites (stadiumdb...) with Wikipedia ones"
+        type: boolean
+        default: false
+      shrink:
+        description: "Only rewrite saved Wikimedia links wider than 1280px to 1280px (no search)"
+        type: boolean
+        default: false
+
+concurrency: venue-photos
+permissions:
+  contents: read
+
+jobs:
+  photos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "psycopg[binary]>=3.2"
+      - name: Find photos
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          WIKI_UA: ${{ secrets.WIKI_UA }}          # "Futlog venue photos (you@example.com)" - Wikimedia asks for a contact
+          LIMIT: ${{ inputs.limit || '150' }}
+          REPLACE: ${{ inputs.replace_external && '--replace-external' || '' }}
+        run: |
+          if [ "${{ inputs.shrink }}" = "true" ]; then python sync_venue_photos.py --shrink
+          else python sync_venue_photos.py --limit "$LIMIT" $REPLACE; fi

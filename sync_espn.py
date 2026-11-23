@@ -27,6 +27,9 @@ season is left alone. Last week is included so its final scores arrive (they dec
 
 --season: "2025-2026" applies to split leagues only, "2025" to calendar leagues only (others are skipped).
 
+Venues: every venue id in the scoreboards is also saved (id + name) in `venues` (never overwriting a row), so each match shows its stadium;
+sync_venue_photos.py then adds the photos.
+
 Per league+season: DELETE + INSERT in ONE transaction. Skipped (nothing deleted) if the fetch fails, returns
 0 matches, or finished matches would shrink >20% vs the table (FORCE=1 overrides).
 """
@@ -58,6 +61,13 @@ EVENTS_DDL = """CREATE TABLE IF NOT EXISTS "fixture_events" (
 \t"event_type" varchar(255), "player" varchar(255), "assist" varchar(255)
 );
 CREATE INDEX IF NOT EXISTS fixture_events_event_idx ON "fixture_events" ("event_id");"""
+VENUES_DDL = """CREATE TABLE IF NOT EXISTS "venues" (
+\t"venueid" integer PRIMARY KEY,
+\t"fullname" varchar(150) NOT NULL,
+\t"photourl" varchar(500) DEFAULT '' NOT NULL,
+\t"photocredit" varchar(255) DEFAULT '' NOT NULL
+);"""
+VENUES = {}            # venue id -> name, collected from every scoreboard event we parse; saved by save_venues()
 RECENT_DAYS = 3        # finished matches this recent are re-fetched every run (VAR / late corrections)
 
 
@@ -206,6 +216,8 @@ def parse_event(ev, cfg, label, now):
     if st.get("completed"):
         hw, aw = str(bool(h.get("winner"))).lower(), str(bool(a.get("winner"))).lower()
     ven = comp.get("venue") or {}
+    if str(ven.get("id") or "").isdigit() and (ven.get("fullName") or "").strip():
+        VENUES[int(ven["id"])] = " ".join(ven["fullName"].split())[:150]
     return [None, label, cfg["comp_id"], ev["id"], d.strftime("%Y-%m-%d %H:%M:%S+00"), ven.get("id"),
             num(comp.get("attendance")) if started and comp.get("attendance") else None,
             ht["id"], at["id"], hw, aw, hs, as_, num(h.get("shootoutScore")), num(a.get("shootoutScore")),
@@ -386,6 +398,23 @@ def load_window(url, cfg, rows, start, end, force, create_table, ev_rows=(), ev_
 
 
 # ------------------------------------------------------------------ main
+def save_venues(url):
+    """Add every venue seen in the scoreboards to `venues` (id + name) so the site can show the stadium name and sync_venue_photos.py
+    has something to look up. Existing rows are never touched (a hand-corrected name or a photo stays). Own connection: if the table is
+    missing or this fails, the fixtures that were already loaded are not affected."""
+    if not VENUES:
+        return
+    import psycopg
+    try:
+        with psycopg.connect(url) as conn, conn.cursor() as cur:
+            cur.execute(VENUES_DDL)
+            cur.executemany('INSERT INTO "venues" ("venueid", "fullname") VALUES (%s, %s) ON CONFLICT ("venueid") DO NOTHING',
+                            sorted(VENUES.items()))
+            print(f"\nvenues: {len(VENUES)} seen, {max(cur.rowcount, 0)} new (existing rows untouched)")
+    except Exception as e:                                  # noqa: BLE001 - never fail the run over venue names
+        print(f"\nWARNING: venues not saved: {e}")
+
+
 def known_team_ids():
     path = os.path.join(HERE, "teams.csv")
     if not os.path.exists(path):
@@ -491,6 +520,14 @@ def main():
                 print(f"  WARNING (optional league, not loaded): {e}"); warned.append(cfg["espn"])
             else:
                 print(f"  FAILED: {e}"); failed.append(cfg["espn"])
+    if VENUES:
+        if args.dry_run:
+            os.makedirs(os.path.join(HERE, "out"), exist_ok=True)
+            with open(os.path.join(HERE, "out", "venues.csv"), "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh); w.writerow(["venueid", "fullname"]); w.writerows(sorted(VENUES.items()))
+            print(f"\nwrote out/venues.csv ({len(VENUES)} venues)")
+        else:
+            save_venues(url)
     if warned:
         print("\nOptional leagues that could not be loaded (check the slug with --find): " + ", ".join(warned))
     if failed:

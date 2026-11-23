@@ -35,3 +35,22 @@ schedule, matches the teams to `teams.csv`, and loads everything into the SQL ta
   so `aze.1` is a best-effort optional entry. Azerbaijan's national team is included via the competitions above.
   Check with `python sync_espn.py --find aze`; if a real slug shows up, put it in `leagues.json`.
 * Clubs/teams missing from `teams.csv` are listed in the log (`note: N team(s) not in teams.csv`).
+
+## Venue names + photos (`venues` table)
+`venues` = `venueid`, `fullname`, `photourl`, `photocredit`. Two steps fill it:
+1. **`sync_espn.py` saves every venue it sees** (id + name from the ESPN scoreboard, `INSERT ... ON CONFLICT DO NOTHING`, so a name or photo you
+   corrected by hand is never overwritten). `--dry-run` writes `out/venues.csv`. Venues of teams that play in none of the leagues in `leagues.json`
+   are not seen, so they get no row (and no photo).
+2. **`sync_venue_photos.py` finds a photo on Wikipedia / Wikimedia Commons** and saves Wikimedia's own *thumbnail* link (1280px by default, never the
+   multi-MB original) plus the author/licence line in `photocredit`. Only free Commons files are used, never logos/crests/maps.
+
+        pip install "psycopg[binary]>=3.2"
+        python sync_venue_photos.py --lookup "Emirates Stadium" --team Arsenal    # try the search on one name, no database
+        python sync_venue_photos.py --csv venues.csv --dry-run                    # try a whole CSV, writes out/venue_photos.csv
+        DATABASE_URL=... python sync_venue_photos.py --limit 150                  # fill venues without a photo, busiest first
+        DATABASE_URL=... python sync_venue_photos.py --shrink                     # 3840px links already saved -> 1280px (no search)
+        DATABASE_URL=... python sync_venue_photos.py --replace-external           # swap stadiumdb.com etc. photos for Wikipedia ones
+
+Venues with no match are remembered in `venue_photo_misses` and retried after 60 days. Set `WIKI_UA="Your site (you@example.com)"` (Wikimedia asks for
+a contact). GitHub: `venue-photos.yml` runs it weekly (secrets: `DATABASE_URL`, optional `WIKI_UA`). **Always spot-check the first results**: a search can
+pick the wrong stadium; fix one with `UPDATE venues SET photourl='...', photocredit='...' WHERE venueid=...`.
