@@ -78,3 +78,18 @@ To see what the database has for a team (France = 478; the women's team is 2755)
 
 National venue photos: `python sync_venue_photos.py --national --limit 0` looks up every ground used by a national competition (league ids 800+)
 first; the weekly workflow does this before the general run.
+
+## Better venue photos (`venue_resolver.py`) - national-team grounds
+`sync_venue_photos.py` now asks `venue_resolver.resolve()` first, then falls back to the old English-Wikipedia search:
+1. **Wikidata** entity search (any language + aliases), must be a stadium/arena class and agree with ESPN's city/country -> picture `P18`, panorama `P4291`, or a file in its Commons category.
+2. **Commons geosearch**: free photos taken within 250 m of the stadium's coordinates.
+3. **Commons text search** `"<name> stadium"`.
+`sync_espn.py` now also stores ESPN's `city` and `country` in `venues` (new columns, filled only when blank) so two grounds with the same name are told apart.
+Result lines show which route worked: `[wikidata image]`, `[commons geosearch]`, ...
+
+## Match photos for posters (`sync_match_photos.py`)
+    python sync_match_photos.py --lookup "Azerbaijan" "Sweden" --date 2025-09-09
+    DATABASE_URL=... python sync_match_photos.py --national --limit 50
+Only **Wikimedia Commons** files with CC0 / public domain / CC BY / CC BY-SA licences, taken on the match date (+/- 1 day) and naming one of the teams.
+Credit + licence are stored in `match_photos` and **must be shown** on the poster (small print). Never scrape ESPN / Getty / AP / federation photos.
+Most matches have no free photo: keep a fallback poster (stadium photo + your own graphics). Team crests/logos are trademarks: check your rights separately.

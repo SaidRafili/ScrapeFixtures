@@ -12,6 +12,10 @@ on:
         description: "Also try to replace photos hosted on other sites (stadiumdb...) with Wikipedia ones"
         type: boolean
         default: false
+      match_photos:
+        description: "Also look for free Commons photos of finished national-team matches"
+        type: boolean
+        default: false
       shrink:
         description: "Only rewrite saved Wikimedia links wider than 1280px to 1280px (no search)"
         type: boolean
@@ -43,3 +47,9 @@ jobs:
             python sync_venue_photos.py --national --limit 0 $REPLACE      # grounds of national-team matches first (few matches each, so a busiest-first run would never reach them)
             python sync_venue_photos.py --limit "$LIMIT" $REPLACE
           fi
+      - name: Free match photos (optional, Commons only)
+        if: ${{ inputs.match_photos }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          WIKI_UA: ${{ secrets.WIKI_UA }}
+        run: python sync_match_photos.py --national --limit 50

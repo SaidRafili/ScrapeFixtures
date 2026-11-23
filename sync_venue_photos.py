@@ -153,8 +153,21 @@ def commons_file(filename, width):
     return {"url": url, "credit": credit_line(meta), "width": int(ii.get("thumbwidth") or ii.get("width") or 0), "file": filename}
 
 
-def find_photo(name, teams=(), width=1280):
-    """-> { url, credit, page, file } or { miss: reason }"""
+def find_photo(name, teams=(), width=1280, city="", country=""):
+    """-> { url, credit, page, file } or { miss: reason }
+    Tries the Wikidata / Commons-geosearch resolver first (finds national grounds whose Wikipedia title differs from ESPN's name), then the
+    original English-Wikipedia article search."""
+    try:
+        import venue_resolver
+        r = venue_resolver.resolve(name, city, country, teams, width)
+        if r.get("url"):
+            return r
+    except Exception as e:                                  # noqa: BLE001 - fall back to the old search
+        print(f"       (resolver error for {name}: {e})", flush=True)
+    return find_photo_wikipedia(name, teams, width)
+
+
+def find_photo_wikipedia(name, teams=(), width=1280):
     name = clean_name(name)
     name_tokens = distinctive(name)
     if not name_tokens:
@@ -214,12 +227,13 @@ def db_rows(cur, replace_external, retry_days, limit, only, league_ids=None, min
     cond = "v.photourl = ''" + (r" OR (v.photourl ~ '^https?://' AND v.photourl !~ '^https://(upload|thumb)\.wikimedia\.org/')" if replace_external else "")
     lid = "CASE WHEN f.league_id ~ '^[0-9]+$' THEN f.league_id::int END"
     league = (f" AND {lid} = ANY(%(lids)s)" if league_ids else "") + (f" AND {lid} >= %(minl)s" if min_league else "")
-    cur.execute(f"""SELECT v.venueid, v.fullname, v.photourl, {cnt} AS n, {home} AS home FROM "venues" v {join}
+    cur.execute(f"""SELECT v.venueid, v.fullname, v.photourl, {cnt} AS n, {home} AS home,
+                            max(to_jsonb(v) ->> 'city') AS city, max(to_jsonb(v) ->> 'country') AS country FROM "venues" v {join}
                      WHERE v.fullname <> '' AND ({cond}){league} AND (%(only)s::int IS NOT NULL AND v.venueid = %(only)s
                         OR %(only)s::int IS NULL AND v.venueid NOT IN (SELECT venueid FROM venue_photo_misses WHERE tried_at > now() - make_interval(days => %(days)s)))
                      GROUP BY v.venueid, v.fullname, v.photourl ORDER BY n DESC, v.venueid LIMIT NULLIF(%(limit)s, 0)""",
                 {"only": only, "days": retry_days, "limit": limit, "lids": league_ids or [], "minl": min_league or 0})
-    return [dict(venueid=r[0], fullname=r[1], photourl=r[2], n=r[3], home=r[4]) for r in cur.fetchall()]
+    return [dict(venueid=r[0], fullname=r[1], photourl=r[2], n=r[3], home=r[4], city=r[5] or "", country=r[6] or "") for r in cur.fetchall()]
 
 
 def parse_ids(text):
@@ -285,12 +299,12 @@ def main():
     for v in rows:
         try:
             ctx = ([v["home"]] if v.get("home") else []) + [t for t in teams.get(v["venueid"], []) if t != v.get("home")]
-            r = find_photo(v["fullname"], ctx[:3], args.width)
+            r = find_photo(v["fullname"], ctx[:3], args.width, v.get("city", ""), v.get("country", ""))
         except Exception as e:                              # noqa: BLE001 - one bad venue must not stop the run
             r = {"miss": f"error: {e}"}
         if r.get("url"):
             found += 1
-            print(f'saved  {v["fullname"]} <- "{r["page"]}" ({r["file"]})\n       {r["url"]}\n       {r["credit"]}', flush=True)
+            print(f'saved  {v["fullname"]} <- "{r["page"]}" ({r["file"]}) [{r.get("how", "wikipedia")}]\n       {r["url"]}\n       {r["credit"]}', flush=True)
             out.append([v["venueid"], v["fullname"], r["url"], r["credit"]])
             if conn and not args.dry_run:
                 conn.execute('UPDATE "venues" SET photourl = %s, photocredit = %s WHERE venueid = %s', (r["url"], r["credit"], v["venueid"]))

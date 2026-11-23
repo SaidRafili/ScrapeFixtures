@@ -82,6 +82,7 @@ LEAGUES_DDL = """CREATE TABLE IF NOT EXISTS "leagues" (
 \t"slug" varchar(100) NOT NULL
 );"""
 LEAGUE_INFO = {}       # ESPN slug -> the "leagues[0]" object of its scoreboard (name, abbreviation, logos); saved by save_leagues()
+VENUE_META = {}        # venue id -> (city, country) from ESPN's venue.address; helps the photo finder tell two same-named stadiums apart
 VENUES = {}            # venue id -> name, collected from every scoreboard event we parse; saved by save_venues()
 RECENT_DAYS = 3        # finished matches this recent are re-fetched every run (VAR / late corrections)
 
@@ -245,6 +246,8 @@ def parse_event(ev, cfg, label, now):
     vid = ven.get("id") if str(ven.get("id") or "").isdigit() else (synthetic_venue_id(vname) if vname else None)
     if vid and vname:
         VENUES[int(vid)] = vname
+        addr = ven.get("address") or {}
+        VENUE_META[int(vid)] = (str(addr.get("city") or "")[:80], str(addr.get("country") or "")[:80])
     return [None, label, cfg["comp_id"], ev["id"], d.strftime("%Y-%m-%d %H:%M:%S+00"), vid,
             num(comp.get("attendance")) if started and comp.get("attendance") else None,
             ht["id"], at["id"], hw, aw, hs, as_, num(h.get("shootoutScore")), num(a.get("shootoutScore")),
@@ -469,9 +472,14 @@ def save_venues(url):
     try:
         with psycopg.connect(url) as conn, conn.cursor() as cur:
             cur.execute(VENUES_DDL)
+            cur.execute("ALTER TABLE \"venues\" ADD COLUMN IF NOT EXISTS \"city\" varchar(80) DEFAULT '' NOT NULL")
+            cur.execute("ALTER TABLE \"venues\" ADD COLUMN IF NOT EXISTS \"country\" varchar(80) DEFAULT '' NOT NULL")
             cur.executemany('INSERT INTO "venues" ("venueid", "fullname") VALUES (%s, %s) ON CONFLICT ("venueid") DO NOTHING',
                             sorted(VENUES.items()))
-            print(f"\nvenues: {len(VENUES)} seen, {max(cur.rowcount, 0)} new (existing rows untouched)")
+            new_rows = max(cur.rowcount, 0)
+            cur.executemany('UPDATE "venues" SET "city" = %s, "country" = %s WHERE "venueid" = %s AND "city" = \'\' AND "country" = \'\'',
+                            [(c, k, v) for v, (c, k) in sorted(VENUE_META.items()) if c or k])
+            print(f"\nvenues: {len(VENUES)} seen, {new_rows} new (existing names/photos untouched; blank city/country filled)")
     except Exception as e:                                  # noqa: BLE001 - never fail the run over venue names
         print(f"\nWARNING: venues not saved: {e}")
 
