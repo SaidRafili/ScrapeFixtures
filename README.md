@@ -36,6 +36,13 @@ schedule, matches the teams to `teams.csv`, and loads everything into the SQL ta
   Check with `python sync_espn.py --find aze`; if a real slug shows up, put it in `leagues.json`.
 * Clubs/teams missing from `teams.csv` are listed in the log (`note: N team(s) not in teams.csv`).
 
+## European + continental competitions
+`leagues.json` also includes (all `"optional": true`, so a wrong/unsupported ESPN slug only warns): UEFA Champions League (`uefa.champions`, id 8),
+Europa League (`uefa.europa`, 19), Conference League (`uefa.europa.conf`, 882), Super Cup, the three qualifying rounds, FIFA Club World Cup,
+Copa Libertadores / Sudamericana, CONCACAF Champions Cup, AFC Champions League, CAF Champions League, and domestic cups
+(FA Cup, EFL Cup, Copa del Rey, DFB-Pokal, Coppa Italia, Coupe de France, Turkish Cup). Club competitions use `split` seasons (`2025/26`),
+CWC / Libertadores / Sudamericana / CONCACAF use `calendar`. Verify any slug with `python sync_espn.py --find champions`, and fix or delete lines that don't exist.
+
 ## League names (`leagues` table)
 `sync_espn.py` reads each league's name and logo from ESPN's own scoreboard response and saves them in `leagues` (`leagues.json` `"name"` is only the
 fallback), so new competitions show "FIFA World Cup" instead of "League 801" with no manual step. A real name already in the table is never overwritten;

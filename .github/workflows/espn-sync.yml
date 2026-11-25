@@ -2,7 +2,7 @@ name: ESPN -> fixtures sync
 
 on:
   schedule:
-    - cron: "0 0,12 * * *"       # twice a day: 12:00 am and 12:00 pm UTC (GitHub may start it a few minutes late)
+    - cron: "0 0,4,8,12,16,20 * * *"   # 6x a day, every 4 hours: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC (GitHub may start it a few minutes late)
   workflow_dispatch:
     inputs:
       mode:
